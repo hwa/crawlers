@@ -1,0 +1,284 @@
+(lisp (defpackage weibo-crawler
+        (:use :cl :parenscript :hwa.parenscript.generic)))
+(in-package :weibo-crawler)
+
+
+
+;; general utils
+;;
+
+(defmacro p0 (num)
+  `(+ (if (< ,num 10)
+	  "0"
+	  "")
+      ,num))
+
+(defmacro flog (msg)
+  `(fs.write "phantom-crawler.log" ,msg "a"))
+
+;; (defun tlog* (msg)
+;;   (let* ((d (new Date))
+;; 	 (ds (+ ($. d (getFullYear)) "-"
+;; 		($. d (getMonth)) "-"
+;; 		($. d (getDate)) " "
+;; 		($. d (getHours)) ":"
+;; 		($. d (getMinutes)) ":"
+;; 		($. d (getSeconds)) ":")))
+;;     (flog (+ ds " " msg))))
+
+(defmacro tlog* (msg)
+  (let ((d (gensym))
+        (ds (gensym)))
+    `(let* ((,d (new Date))
+            (,ds (+ ($. ,d (getFullYear)) "-"
+                    (p0 (1+ ($. ,d (getMonth)))) "-"
+                    (p0 ($. ,d (getDate))) " "
+                    (p0 ($. ,d (getHours))) ":"
+                    (p0 ($. ,d (getMinutes))) ":"
+                    (p0 ($. ,d (getSeconds))) ":")))
+       (flog (+ ,ds " " ,msg #\Newline)))))
+
+
+(defmacro tlog (msg)
+  (let ((d (gensym))
+        (ds (gensym)))
+    `(let* ((,d (new Date))
+            (,ds (+ ($. ,d (getFullYear)) "-"
+                    (p0 (1+ ($. ,d (getMonth)))) "-"
+                    (p0 ($. ,d (getDate))) " "
+                    (p0 ($. ,d (getHours))) ":"
+                    (p0 ($. ,d (getMinutes))) ":"
+                    (p0 ($. ,d (getSeconds))) ":")))
+       (clog (+ ,ds " " ,msg)))))
+
+
+
+(defmacro eval-in (page &body body)
+  `($. ,page (evaluate (lambda ()
+			 ,@body))))
+
+
+;; weibo utils
+;;
+(defun inject-jquery-underscore (page)
+  (page.injectJs "./js-libs/jquery.min.js")
+  (page.injectJs "./js-libs/underscore.js"))
+
+
+(defmacro click (selector)
+  (let ((evt (gensym)))
+    `(let ((,evt (document.createEvent "HTMLEvents")))
+       ($. ,evt (initEvent "click" t t))
+       ($. (document.querySelector ,selector)
+	   (dispatchEvent ,evt)))))
+
+(defmacro click-el (el)
+  (let ((evt (gensym)))
+    `(let ((,evt (document.createEvent "HTMLEvents")))
+       ($. ,evt (initEvent "click" t t))
+       ($. ,el
+	   (dispatchEvent ,evt)))))
+
+;; requires
+;;
+(var webpage (require "webpage"))
+(var system (require "system"))
+(var fs (require "fs"))
+
+(defvar *user-agent* "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_8_2) AppleWebKit/537.17 (KHTML, like Gecko) Chrome/24.0.1312.57 Safari/537.17")
+
+(defun new-page ()
+  (let ((page ($. webpage (create))))
+    (setf page.onConsoleMessage
+	  (lambda (msg)
+	    (tlog* (+ "Page Console >> " msg))))
+
+    (setf (@ page settings userAgent) *user-agent*)
+    page))
+  
+
+(defun open-login-page (callback)
+  (let ((page (new-page)))
+    
+    (page.open "http://weibo.com/"
+	       (lambda (status)
+		 (if (= status "fail")
+		     (tlog* "failed to open page")
+		     (progn (tlog* "Opened login page.")
+			    (funcall callback page)))))))
+
+
+(defun post-login (page username password user-id callback)
+  (setf page.onLoadFinished
+	(lambda ()
+	  (let ((url (page.evaluate (lambda ()
+				      (@ window location href)))))
+	    (when (= (+ "http://weibo.com/u/" user-id)
+		     ($. url (split "?") 0))
+	      ;;此页载三次，第三次才真正登陆成功。
+	      (setf page.onLoadFinished nil)
+	      (tlog* (+ "Login as user: " username))
+	      (funcall callback page)))))
+  (inject-jquery-underscore page)
+  (page.evaluate
+   (lambda (username password)
+     (jQuery.noConflict)
+     (window.setTimeout  ;; 延后提交，JS尚未完成DOM
+      (lambda ()
+	($. (jQuery "input[name=username]") (val username))
+	($. (jQuery "input[name=password]") (val password))
+	(click "a[action-type=btn_submit] span")
+	(tlog "Clicked login button."))
+      300))
+   username password))
+
+(defun login (username password user-id callback)
+  (open-login-page 
+   (lambda (page)
+     (post-login page username password user-id callback))))
+
+
+
+(defun get-reposts (page url outfile)
+  (defun get-posts ()
+    (labels ((parse-date (str)
+	       (let* ((fulldate (new (RegExp "(\\d+)-(\\d+)-(\\d+) (\\d+):(\\d+)")))	;2011-5-18 15:45
+		      (date-parts ($. fulldate (exec str)))
+		      (minutes-ago (new (RegExp "(\\d+)\\u5206\\u949f\\u524d")))
+		      (minutes ($. minutes-ago (exec str)))
+		      (today (new (RegExp "\\u4eca\\u5929 (\\d+):(\\d+)")))
+		      (hour-minute ($. today (exec str)))
+		      (now (new (Date))))
+		 (cond (date-parts (new (Date (@ date-parts 1)
+					      (1- (@ date-parts 2))
+					      (@ date-parts 3)
+					      (@ date-parts 4)
+					      (@ date-parts 5))))
+		       (minutes-ago (let ((time (new (Date
+						      (- ($. now (getTime))
+							 minutes)))))
+				      (new (Date ($. time (getFullYear))
+						 ($. time (getMonth))
+						 ($. time (getDate))
+						 ($. time (getHours))
+						 ($. time (getMinutes))))))
+		       (hour-minute (new (Date ($. now (getFullYear))
+					       ($. now (getMonth))
+					       ($. now (getDate))
+					       (@ hour-minute 1)
+					       (@ hour-minute 2)))))))
+	     (get-time (el)
+	       (let* ((txt ($. (jQuery "span" el) (first) (text)))
+		      (dtxt ($. txt (slice 1 (1- (length txt))))))
+		 ($. (parse-date dtxt) (getTime))))
+	     (get-repost-num (el)
+	       (let ((txt ($. (jQuery "a[action-data]" el) (text))))
+		 (if (< 2 (length txt))
+		     (parseInt ($. txt (slice 3 (1- (length txt)))))
+		     0)))
+	     (get-repost-url (el)
+	       (let ((action-data ($. (jQuery "a[action-type=feed_list_forward]" el)
+				      (attr "action-data")))
+		     (re (new (RegExp "&url=([^&]+)"))))
+		 ($. re (exec action-data) 1)))		 
+	     (get-post ()
+	       ({} :username ($. (jQuery "a" this) (first) (text))
+		   :msg ($. (jQuery "em" this) (first) (text))
+		   :time (get-time this)
+		   :repost-num (get-repost-num this)
+		   :repost-url (get-repost-url)))
+	     (get-page-posts ()
+	       (clog ($. (jQuery "dd") length))
+	       (let* ((reposts ($. (jQuery "div[node-type=feed_list]")
+				   (not "div.comment_lists")
+				   (find "dl.comment_list dd")
+				   (map #'get-post))))
+		 (tlog (+ "got " (@ reposts length) " reposts."))
+		 ($. reposts (toArray)))))
+      (get-page-posts)))
+
+  (defun has-next-page? ()
+    (cond ((/= 0 ($. (jQuery "a.btn_page_next") length))
+	   ($. (jQuery "a.btn_page_next span") (last) 0))
+	  ((= "下一页" ($. (jQuery "span[action-type=feed_list_page]") (last) (text) (trim)))
+	   ($. (jQuery "span[action-type=feed_list_page]") (last) 0))
+	  (t f)))
+
+  (defun click-next-page ()
+    (labels ((has-next-page? ()
+	       (cond ((/= 0 ($. (jQuery "a.btn_page_next") length))
+		      ($. (jQuery "a.btn_page_next span") (last) 0))
+		     ((= "下一页" ($. (jQuery "span[action-type=feed_list_page]") (last) (text) (trim)))
+		      ($. (jQuery "span[action-type=feed_list_page]") (last) 0))
+		     (t f))))
+      (click-el (has-next-page?))))
+
+  (labels ((write-out (data)
+	     (tlog* (+ "Got total " (@ data reposts length)
+		       " reposts"))
+	     (fs.write outfile (JSON.stringify data))
+	     (phantom.exit)))
+
+    (setf page.onResourceRequested
+	  (lambda (rq nd)
+	    (when (= "http://weibo.com/aj/mblog/info/big"
+		     ($. rq url (slice 0 34)))
+	      (write-out ({} :reposts ([])
+			     :next-page-url (@ rq url))))))
+    (setf page.onLoadFinished
+	  (lambda ()
+	    (inject-jquery-underscore page)
+	    (page.evaluate #'click-next-page)))
+
+    (page.evaluate 
+     (lambda (url)
+       (setf (@ window location href) url))
+     url)))
+
+
+(defun open-directly (user-id onsuccess onfailed)
+  (let ((page (new-page)))
+
+    (setf page.onLoadFinished
+	  (lambda ()
+	    (when (= (@ page title) "")
+	      (page.reload))
+	    (when (= "http://weibo.com/u"
+		     ($. page url (slice 0 18)))
+	      (setf page.logging nil)
+	      (funcall onsuccess page))
+	    (when (= "http://weibo.com/signup/"
+		     ($. page url (slice 0 24)))
+	      (funcall onfailed page))))
+    (page.open (+ "http://weibo.com/u/" user-id))))
+
+
+(defun crawl_repost (url outfile)
+  (let ((username "cheng.zhang@gmail.com")
+  	(password "1qa2ws")
+  	(userid "3240189394"))
+  ;; (let ((username "blueberry_234@163.com")
+  ;; 	(password "blueberry")
+  ;; 	(userid "3305942100"))
+    (tlog* (+ "Crawling reposts of weibo: " url))
+    (open-directly userid
+		   (lambda (page)
+		     (tlog* (+ "Auto login directly, url now: " page.url))
+		     (setf page.onLoadFinished nil)		     
+		     (get-reposts page url outfile))
+		   (lambda (page)
+		     (tlog* (+ "Failed to auto login, url now: " page.url))
+		     (setf page.onLoadFinished nil)
+		     (tlog* "Try relogin.")
+		     (login username password userid
+			    (lambda (page2)
+			      (get-reposts page2 url outfile)))))))
+
+
+;; main
+(crawl_repost (@ system args 1)
+	      (@ system args 2))
+
+
+
+
